@@ -1,235 +1,155 @@
-const { Client, GatewayIntentBits } = require('discord.js');
+require("dotenv").config();
+const { Client, GatewayIntentBits, PermissionsBitField } = require("discord.js");
+const express = require("express");
+
+const app = express();
+app.get("/", (req, res) => res.send("Bot alive"));
+app.listen(3000);
 
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMessages,
-    GatewayIntentBits.MessageContent
+    GatewayIntentBits.MessageContent,
+    GatewayIntentBits.GuildMembers
   ]
 });
 
-let activeEvent = null;
+// track survival levels
+const survival = new Map(); // userId -> level
 
-// SURVIVAL SYSTEM
-const survival = {};
+// active game per server
+const active = new Map();
 
-const SURVIVE_ROLES = [
-  "I SURVIVED 1",
-  "I SURVIVED 2",
-  "I SURVIVED 3"
-];
-
-// EVENTS (GENERIC)
 const events = [
   {
-    type: "word",
-    text: "⚡ FIRST to type the secret word wins something...",
-    word: "typeit",
-    rewardRole: "Reward 1"
+    name: "🔥 FIRST TO TALK GETS MUTED",
+    type: "mute_first"
   },
-
   {
-    type: "firstAny",
-    text: "💀 FIRST person to send a message triggers something...",
-    punishRole: "Punish 1",
-    timeout: 10 * 1000
+    name: "☠️ LAST PERSON TO TALK LOSES",
+    type: "last_loses"
   },
-
   {
-    type: "reaction",
-    text: "🎯 FIRST to react with 👁️ wins something...",
-    emoji: "👁️",
-    rewardRole: "Reward 1"
+    name: "🤫 SURVIVE SILENCE FOR 20 SECONDS",
+    type: "silence_win"
   },
-
   {
-    type: "vote",
-    text: "🗳️ Nominate someone. Most mentioned gets affected...",
-    duration: 15000,
-    punishRole: "Punish 1"
+    name: "⚡ FAST TYPE CHALLENGE (first message wins)",
+    type: "first_win"
   }
 ];
 
-// SURVIVAL LEVEL UP
-async function upgradeSurvivor(member, message) {
-  const id = member.id;
-  if (!survival[id]) survival[id] = 0;
+function giveSurvivalRole(member, level) {
+  const roleName = `I SURVIVED ${level}`;
 
-  if (survival[id] >= 3) {
-    message.channel.send(`🏆 ${member} is already MAX SURVIVOR.`);
+  let role = member.guild.roles.cache.find(r => r.name === roleName);
+
+  if (!role) {
+    member.guild.roles.create({
+      name: roleName,
+      reason: "Survival progression"
+    }).then(r => member.roles.add(r));
+  } else {
+    member.roles.add(role);
+  }
+}
+
+client.on("messageCreate", async (message) => {
+  if (message.author.bot) return;
+
+  const guildId = message.guild.id;
+
+  // START GAME ON BOT MENTION
+  if (message.mentions.has(client.user)) {
+    const event = events[Math.floor(Math.random() * events.length)];
+
+    active.set(guildId, {
+      event,
+      channel: message.channel.id,
+      users: new Set(),
+      winner: null
+    });
+
+    message.channel.send(`🎮 NEW EVENT STARTED!\n\n**${event.name}**`);
     return;
   }
 
-  if (survival[id] > 0) {
-    const oldRole = message.guild.roles.cache.find(
-      r => r.name === SURVIVE_ROLES[survival[id] - 1]
-    );
-    if (oldRole) await member.roles.remove(oldRole);
+  const game = active.get(guildId);
+  if (!game) return;
+
+  game.users.add(message.author.id);
+
+  const member = message.member;
+
+  // 🔥 FIRST WIN EVENT
+  if (game.event.type === "first_win" && !game.winner) {
+    game.winner = member.id;
+
+    message.channel.send(`🏆 ${member.user.username} won the event!`);
+
+    upgradeSurvival(member);
+    active.delete(guildId);
+    return;
   }
 
-  survival[id]++;
+  // ☠️ FIRST TO TALK GETS MUTED
+  if (game.event.type === "mute_first" && !game.winner) {
+    game.winner = member.id;
 
-  const newRole = message.guild.roles.cache.find(
-    r => r.name === SURVIVE_ROLES[survival[id] - 1]
-  );
+    try {
+      await member.timeout(30 * 60 * 1000, "Lost survival event");
+      message.channel.send(`💀 ${member.user.username} got muted for 30 minutes!`);
+    } catch (e) {}
 
-  if (newRole) await member.roles.add(newRole);
+    upgradeSurvival(member);
+    active.delete(guildId);
+    return;
+  }
 
-  message.channel.send(`🛡️ ${member} survived → **${SURVIVE_ROLES[survival[id] - 1]}**`);
-}
+  // ☠️ LAST TO TALK LOSES (simple version)
+  if (game.event.type === "last_loses") {
+    setTimeout(async () => {
+      const users = [...game.users];
+      const loserId = users[Math.floor(Math.random() * users.length)];
 
-// MAIN TRIGGER
-client.on('messageCreate', async (message) => {
-  if (message.author.bot) return;
+      const loser = await message.guild.members.fetch(loserId);
+      message.channel.send(`☠️ ${loser.user.username} lost the round!`);
 
-  // START EVENT
-  if (message.mentions.has(client.user) && !activeEvent) {
+      upgradeSurvival(member);
 
-    const event = events[Math.floor(Math.random() * events.length)];
-    activeEvent = event;
+      active.delete(guildId);
+    }, 20000);
+  }
 
-    message.channel.send(event.text);
+  // 🤫 SILENCE WIN
+  if (game.event.type === "silence_win") {
+    setTimeout(async () => {
+      const users = [...game.users];
+      const winnerId = users[users.length - 1];
 
-    // ======================
-    // WORD EVENT
-    // ======================
-    if (event.type === "word") {
+      const winner = await message.guild.members.fetch(winnerId);
+      message.channel.send(`🏆 ${winner.user.username} survived silence!`);
 
-      const collector = message.channel.createMessageCollector({
-        time: 20000
-      });
+      upgradeSurvival(winner);
 
-      collector.on('collect', async (msg) => {
-
-        if (msg.content.toLowerCase().includes(event.word)) {
-
-          collector.stop();
-
-          const member = await message.guild.members.fetch(msg.author.id);
-
-          const role = message.guild.roles.cache.find(r => r.name === event.rewardRole);
-          if (role) await member.roles.add(role);
-
-          message.channel.send(`🎉 ${member} was FIRST and triggered the event!`);
-
-          await upgradeSurvivor(member, message);
-
-          activeEvent = null;
-        }
-      });
-    }
-
-    // ======================
-    // FIRST MESSAGE EVENT
-    // ======================
-    if (event.type === "firstAny") {
-
-      const collector = message.channel.createMessageCollector({
-        time: 20000
-      });
-
-      collector.on('collect', async (msg) => {
-
-        collector.stop();
-
-        const member = await message.guild.members.fetch(msg.author.id);
-
-        const role = message.guild.roles.cache.find(r => r.name === event.punishRole);
-        if (role) await member.roles.add(role);
-
-        await member.timeout(event.timeout, "Lost event");
-
-        message.channel.send(`💀 ${member} was FIRST and triggered a punishment.`);
-
-        await upgradeSurvivor(member, message);
-
-        activeEvent = null;
-      });
-    }
-
-    // ======================
-    // REACTION EVENT
-    // ======================
-    if (event.type === "reaction") {
-
-      const sent = await message.channel.send("React fast!");
-
-      await sent.react(event.emoji);
-
-      const filter = (reaction, user) =>
-        reaction.emoji.name === event.emoji && !user.bot;
-
-      const collector = sent.createReactionCollector({
-        filter,
-        max: 1,
-        time: 20000
-      });
-
-      collector.on('collect', async (reaction, user) => {
-
-        const member = await message.guild.members.fetch(user.id);
-
-        const role = message.guild.roles.cache.find(r => r.name === event.rewardRole);
-        if (role) await member.roles.add(role);
-
-        message.channel.send(`🎯 ${member} reacted FIRST and won the event!`);
-
-        await upgradeSurvivor(member, message);
-
-        activeEvent = null;
-      });
-    }
-
-    // ======================
-    // VOTING EVENT
-    // ======================
-    if (event.type === "vote") {
-
-      const votes = {};
-
-      const collector = message.channel.createMessageCollector({
-        time: event.duration
-      });
-
-      collector.on('collect', msg => {
-        msg.mentions.users.forEach(u => {
-          votes[u.id] = (votes[u.id] || 0) + 1;
-        });
-      });
-
-      collector.on('end', async () => {
-
-        let max = 0;
-        let loserId = null;
-
-        for (const id in votes) {
-          if (votes[id] > max) {
-            max = votes[id];
-            loserId = id;
-          }
-        }
-
-        if (!loserId) {
-          message.channel.send("🤷 No result.");
-          activeEvent = null;
-          return;
-        }
-
-        const member = await message.guild.members.fetch(loserId);
-
-        const role = message.guild.roles.cache.find(r => r.name === event.punishRole);
-        if (role) await member.roles.add(role);
-
-        await member.timeout(30 * 60 * 1000, "Vote event");
-
-        message.channel.send(`💀 ${member} was voted out.`);
-
-        await upgradeSurvivor(member, message);
-
-        activeEvent = null;
-      });
-    }
+      active.delete(guildId);
+    }, 20000);
   }
 });
 
-client.login("YOUR_BOT_TOKEN");
+// SURVIVAL SYSTEM
+function upgradeSurvival(member) {
+  const id = member.id;
+
+  let level = survival.get(id) || 0;
+  level++;
+
+  if (level > 3) level = 3;
+
+  survival.set(id, level);
+
+  giveSurvivalRole(member, level);
+}
+
+client.login(process.env.TOKEN);
